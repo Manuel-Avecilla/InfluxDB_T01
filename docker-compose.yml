@@ -1,0 +1,82 @@
+services:
+  influxdb:
+    image: influxdb:3-core
+    container_name: iot-influxdb3
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      # El token DEBE empezar por "apiv3_"
+      - INFLUXDB3_ADMIN_TOKEN=apiv3_iot_pruebas_token_super_seguro_1234567890
+    command:
+      - |
+        # Fichero de token "offline": requiere los campos token y name
+        printf '{"token":"%s","name":"admin","description":"Token admin de pruebas"}' "$$INFLUXDB3_ADMIN_TOKEN" > /tmp/admin_token.json
+        chmod 600 /tmp/admin_token.json
+        exec influxdb3 serve \
+          --node-id=node0 \
+          --object-store=file \
+          --data-dir=/var/lib/influxdb3 \
+          --admin-token-file=/tmp/admin_token.json
+    ports:
+      - "8181:8181"
+    volumes:
+      - influxdb_data:/var/lib/influxdb3
+
+  init-influxdb:
+    image: influxdb:3-core
+    depends_on:
+      - influxdb
+    restart: "no"
+    environment:
+      - INFLUXDB3_ADMIN_TOKEN=apiv3_iot_pruebas_token_super_seguro_1234567890
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Reintenta hasta que el servidor responda; si la BD ya existe, termina igualmente
+        until influxdb3 show databases --host http://influxdb:8181 --token "$$INFLUXDB3_ADMIN_TOKEN" 2>/dev/null | grep -qw sensores \
+           || influxdb3 create database sensores --host http://influxdb:8181 --token "$$INFLUXDB3_ADMIN_TOKEN"; do
+          echo "Esperando a InfluxDB..."
+          sleep 2
+        done
+        echo "Base de datos 'sensores' lista"
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    container_name: iot-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_FEATURE_TOGGLES_ENABLE=newInfluxDSConfigPageDesign
+    configs:
+      # Datasource aprovisionado automaticamente al arrancar Grafana
+      - source: grafana_datasource
+        target: /etc/grafana/provisioning/datasources/influxdb.yaml
+    depends_on:
+      - influxdb
+
+configs:
+  grafana_datasource:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: InfluxDB-SQL
+          uid: influxdb-sensores
+          type: influxdb
+          access: proxy
+          url: http://influxdb:8181
+          isDefault: true
+          jsonData:
+            version: SQL
+            product: InfluxDB Enterprise 3.x
+            dbName: sensores
+            httpMode: POST
+            insecureGrpc: true
+          secureJsonData:
+            token: apiv3_iot_pruebas_token_super_seguro_1234567890
+
+volumes:
+  influxdb_data:
+  grafana_data:
