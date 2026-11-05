@@ -18,11 +18,26 @@ Para preparar el entorno de ejecución de los scripts:
 
 # Crear el entorno virtual
 python3 -m venv venv
+```
 
+```bash
 # Activar el entorno virtual
 source venv/bin/activate
+```
 
+```bash
 # Actualizar el gestor de paquetes e instalar dependencias
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+Despues de crear y activar el entorno virtual, podemos ejecutar los scripts:
+```bash
+# Ejecutar el script
+python simulador.py
+```
+```bash
+# Ejecutar el script
+python generador_sensores_temp.py
+```
+ctrl + c para detener la ejecución de los scripts.
