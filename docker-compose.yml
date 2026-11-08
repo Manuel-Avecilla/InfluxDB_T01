@@ -15,11 +15,35 @@ services:
           --node-id=node0 \
           --object-store=file \
           --data-dir=/var/lib/influxdb3 \
+          --plugin-dir=/plugins \
           --admin-token-file=/tmp/admin_token.json
     ports:
       - "8181:8181"
     volumes:
       - influxdb_data:/var/lib/influxdb3
+      # CAMBIO: volumen con los plugins (se borra con "docker compose down -v")
+      - plugins_data:/plugins
+    depends_on:
+      init-plugins:
+        condition: service_completed_successfully
+
+  # CAMBIO: prepara el volumen de plugins (copia el plugin y da permisos de escritura)
+  init-plugins:
+    image: influxdb:3-core
+    user: root
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /plugins
+        cp /downsample_5m.py /plugins/downsample_5m.py
+        chmod -R 777 /plugins
+        echo "Plugin copiado en /plugins"
+    volumes:
+      - plugins_data:/plugins
+    configs:
+      - source: downsample_plugin
+        target: /downsample_5m.py
 
   init-influxdb:
     image: influxdb:3-core
@@ -31,13 +55,16 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        # Reintenta hasta que el servidor responda; si la BD ya existe, termina igualmente
-        until influxdb3 show databases --host http://influxdb:8181 --token "$$INFLUXDB3_ADMIN_TOKEN" 2>/dev/null | grep -qw sensores \
-           || influxdb3 create database sensores --host http://influxdb:8181 --token "$$INFLUXDB3_ADMIN_TOKEN"; do
-          echo "Esperando a InfluxDB..."
-          sleep 2
+        # Crea las dos databases (sensores y trafico_5m).
+        # Reintenta hasta que el servidor responda; si la BD ya existe, continúa.
+        for db in sensores trafico_5m; do
+          until influxdb3 show databases --host http://influxdb:8181 --token "$$INFLUXDB3_ADMIN_TOKEN" 2>/dev/null | grep -qw "$$db" \
+             || influxdb3 create database "$$db" --host http://influxdb:8181 --token "$$INFLUXDB3_ADMIN_TOKEN"; do
+            echo "Esperando a InfluxDB..."
+            sleep 2
+          done
+          echo "Base de datos '$$db' lista"
         done
-        echo "Base de datos 'sensores' lista"
 
   grafana:
     image: grafana/grafana:12.2.0
@@ -51,13 +78,76 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_FEATURE_TOGGLES_ENABLE=newInfluxDSConfigPageDesign
     configs:
-      # Datasource aprovisionado automaticamente al arrancar Grafana
+      # Datasources aprovisionados automaticamente al arrancar Grafana
       - source: grafana_datasource
         target: /etc/grafana/provisioning/datasources/influxdb.yaml
     depends_on:
       - influxdb
 
 configs:
+  # CAMBIO: el plugin de downsampling va dentro del compose (sin carpetas locales)
+  downsample_plugin:
+    content: |
+        """
+        Plugin programado (Processing Engine de InfluxDB 3) - Downsampling a 5 minutos.
+
+        Se ejecuta cada minuto (trigger every:1m sobre la database "sensores"):
+          1. Lee trafico_raw de la database "sensores".
+          2. Calcula la media de traffic_in, traffic_out y latency por router en
+             ventanas de 5 minutos.
+          3. Escribe el resultado en la database "trafico_5m" (tabla trafico_5m).
+
+        Notas:
+          - LineBuilder ya está disponible dentro del Processing Engine (no se importa).
+          - La consulta empieza en el límite de una ventana de 5 min, así nunca se
+            calcula una ventana "cortada" a medias.
+          - Escribir el mismo device + timestamp otra vez sobrescribe el punto, así que
+            la ejecución cada minuto actualiza la ventana actual sin duplicar datos.
+        """
+
+        SOURCE_TABLE = "trafico_raw"
+        TARGET_DB = "trafico_5m"
+        TARGET_TABLE = "trafico_5m"
+
+        SQL = f"""
+        SELECT date_bin(INTERVAL '5 minutes', time) AS ventana,
+               device,
+               AVG(traffic_in)  AS traffic_in,
+               AVG(traffic_out) AS traffic_out,
+               AVG(latency)     AS latency
+        FROM {SOURCE_TABLE}
+        WHERE time >= date_bin(INTERVAL '5 minutes', now() - INTERVAL '5 minutes')
+        GROUP BY ventana, device
+        ORDER BY ventana, device
+        """
+
+        FIELDS = ("traffic_in", "traffic_out", "latency")
+
+
+        def process_scheduled_call(influxdb3_local, call_time, args=None):
+            rows = influxdb3_local.query(SQL)
+
+            if not rows:
+                influxdb3_local.warn("downsample_5m: sin datos en trafico_raw para la ventana")
+                return
+
+            escritos = 0
+            for row in rows:
+                line = LineBuilder(TARGET_TABLE).tag("device", row["device"])  # noqa: F821
+                tiene_campos = False
+                for campo in FIELDS:
+                    valor = row.get(campo)
+                    if valor is not None:
+                        line.float64_field(campo, float(valor))
+                        tiene_campos = True
+                if not tiene_campos:
+                    continue
+                line.time_ns(int(row["ventana"]))
+                influxdb3_local.write_to_db(TARGET_DB, line)
+                escritos += 1
+
+            influxdb3_local.info(f"downsample_5m: {escritos} puntos escritos en {TARGET_DB}.{TARGET_TABLE}")
+
   grafana_datasource:
     content: |
       apiVersion: 1
@@ -76,7 +166,21 @@ configs:
             insecureGrpc: true
           secureJsonData:
             token: apiv3_iot_pruebas_token_super_seguro_1234567890
+        - name: InfluxDB-SQL-5m
+          uid: influxdb-trafico5m
+          type: influxdb
+          access: proxy
+          url: http://influxdb:8181
+          jsonData:
+            version: SQL
+            product: InfluxDB Enterprise 3.x
+            dbName: trafico_5m
+            httpMode: POST
+            insecureGrpc: true
+          secureJsonData:
+            token: apiv3_iot_pruebas_token_super_seguro_1234567890
 
 volumes:
   influxdb_data:
   grafana_data:
+  plugins_data:
